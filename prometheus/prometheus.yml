@@ -1,0 +1,51 @@
+# Prometheus - thu thập metrics của hệ thống Hotel Booking.
+# Mọi target được gọi bằng tên service trên network "monitoring".
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    project: hotel-booking
+
+rule_files:
+  - /etc/prometheus/rules.yml
+
+scrape_configs:
+  - job_name: prometheus
+    metrics_path: /prometheus/metrics
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Ứng dụng Node.js (prom-client): HTTP, nghiệp vụ đặt phòng, Node.js runtime
+  - job_name: hotel-app
+    static_configs:
+      - targets: ["app:3000"]
+
+  # PostgreSQL qua postgres-exporter (role hotel_monitor, chỉ quyền pg_monitor)
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  # Nginx stub_status qua nginx-prometheus-exporter
+  - job_name: nginx
+    static_configs:
+      - targets: ["nginx-exporter:9113"]
+
+  # Tài nguyên container (CPU, RAM, network) qua cAdvisor
+  - job_name: cadvisor
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    metric_relabel_configs:
+      # Chỉ giữ container của project, bỏ cgroup hệ thống -> giảm số series
+      - source_labels: [container_label_com_docker_compose_project]
+        regex: hotel-booking
+        action: keep
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: promtail
+    static_configs:
+      - targets: ["promtail:9080"]

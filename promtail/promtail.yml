@@ -1,0 +1,85 @@
+# Promtail: thu thập log stdout/stderr của các container trong project qua Docker API.
+# Nhãn (label) giữ ở mức cardinality thấp: job, project, service, container, stream, level.
+# Các trường biến thiên cao (status, uri, ip, booking_id...) KHÔNG làm label,
+# mà được trích xuất lúc truy vấn bằng `| json`.
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  filename: /positions/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    batchwait: 1s
+    batchsize: 1048576
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+        # Chỉ lấy container của project này
+        filters:
+          - name: label
+            values: ["com.docker.compose.project=hotel-booking"]
+    relabel_configs:
+      - target_label: job
+        replacement: docker
+      - source_labels: [__meta_docker_container_name]
+        regex: "/(.*)"
+        target_label: container
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        target_label: service
+      - source_labels: [__meta_docker_container_label_com_docker_compose_project]
+        target_label: project
+      - source_labels: [__meta_docker_container_log_stream]
+        target_label: stream
+    pipeline_stages:
+      # Ứng dụng ghi log JSON: lấy level (info/warn/error) làm label, dùng time trong log
+      - match:
+          selector: '{service="app"}'
+          stages:
+            - json:
+                expressions:
+                  level: level
+                  time: time
+            - labels:
+                level:
+            - timestamp:
+                source: time
+                format: RFC3339Nano
+      # Nginx: stdout = access log JSON, stderr = error log "[error]" ...
+      - match:
+          selector: '{service="nginx", stream="stdout"}'
+          stages:
+            - static_labels:
+                log_type: access
+      - match:
+          selector: '{service="nginx", stream="stderr"}'
+          stages:
+            - static_labels:
+                log_type: error
+            - regex:
+                expression: '\[(?P<level>emerg|alert|crit|error|warn|notice|info|debug)\]'
+            - labels:
+                level:
+      # PostgreSQL: gộp câu lệnh SQL nhiều dòng (STATEMENT/DETAIL) vào bản ghi bắt đầu bằng timestamp
+      - match:
+          selector: '{service="db"}'
+          stages:
+            - multiline:
+                firstline: '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}'
+                max_wait_time: 3s
+            - regex:
+                expression: '^\S+ \S+ \S+ \[\d+\] (?P<level>[A-Z]+):'
+            - template:
+                source: level
+                template: '{{ ToLower .Value }}'
+            - labels:
+                level:
+      # Bỏ log healthcheck/ping của pgAdmin để giảm nhiễu
+      - match:
+          selector: '{service="pgadmin"} |= "/misc/ping"'
+          action: drop

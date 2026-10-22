@@ -1,0 +1,38 @@
+# Cảnh báo cơ bản (xem tại Prometheus > Alerts). Chưa gửi thông báo vì không có Alertmanager.
+groups:
+  - name: hotel-booking
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Target {{ $labels.job }} ({{ $labels.instance }}) không phản hồi"
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "postgres-exporter không kết nối được PostgreSQL"
+
+      - alert: HighHttp5xxRate
+        expr: sum(rate(http_request_duration_seconds_count{job="hotel-app",status_code=~"5.."}[5m])) > 0.1
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Ứng dụng trả về lỗi 5xx > 0.1 req/s"
+
+      - alert: SlowRequests
+        expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job="hotel-app"}[5m]))) > 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "p95 thời gian phản hồi của ứng dụng > 1s"
+
+      - alert: ContainerHighMemory
+        expr: container_memory_working_set_bytes{name=~"hotel_.+"} / container_spec_memory_limit_bytes{name=~"hotel_.+"} > 0.9 and container_spec_memory_limit_bytes{name=~"hotel_.+"} > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Container {{ $labels.name }} dùng > 90% giới hạn RAM"

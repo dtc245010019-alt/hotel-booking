@@ -1,3 +1,10 @@
 .env
 nginx/certs/
 node_modules/
+nginx/htpasswd
+*.log
+.DS_Store
+.env.*
+!.env.example
+__pycache__/
+*.pyc

@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Hotel Booking DB",
+      "Group": "Servers",
+      "Host": "db",
+      "Port": 5432,
+      "MaintenanceDB": "postgres",
+      "Username": "hotel_admin",
+      "SSLMode": "prefer",
+      "Comment": "PostgreSQL của hệ thống đặt phòng. Mật khẩu = DB_PASSWORD trong .env"
+    }
+  }
+}

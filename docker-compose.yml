@@ -1,72 +1,289 @@
+# Hotel Booking - Đề 6
+# Khởi chạy:  ./scripts/setup.sh && docker-compose up -d --build
+#
+# Network:
+#   frontend   - chỉ Nginx publish cổng ra host (8088, 8443)
+#   backend    - internal: app <-> PostgreSQL, pgAdmin, postgres-exporter
+#   monitoring - internal: Prometheus, Grafana, Loki, Promtail, exporters
+# Không có service nào ngoài Nginx publish cổng; PostgreSQL không ra ngoài.
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
 services:
+  # ------------------------------------------------------------ PostgreSQL
   db:
-    image: postgres:15-alpine
+    <<: *hardening
+    image: postgres:15.19-alpine3.23
     container_name: hotel_db
-    restart: unless-stopped
+    # Chạy thẳng bằng uid postgres (70): entrypoint không cần quyền root/chown
+    user: "70:70"
+    read_only: true
+    tmpfs: [/tmp, /var/run/postgresql]
+    shm_size: 128m
     environment:
       POSTGRES_DB: ${DB_NAME}
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      MONITOR_DB_PASSWORD: ${MONITOR_DB_PASSWORD}
+      TZ: Asia/Ho_Chi_Minh
+      PGTZ: Asia/Ho_Chi_Minh
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./app/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+      - ./db/init:/docker-entrypoint-initdb.d:ro
     networks: [backend]
-    security_opt: ["no-new-privileges:true"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
+    mem_limit: 512m
+    cpus: 1.0
 
+  # --------------------------------------------------- Ứng dụng Node.js
   app:
+    <<: *hardening
     build: ./app
+    image: hotel-booking-app:2.0.0
     container_name: hotel_app
-    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
     environment:
       DB_HOST: db
       DB_NAME: ${DB_NAME}
       DB_USER: hotel_app
       DB_PASSWORD: ${APP_DB_PASSWORD}
+      ADMIN_USER: ${ADMIN_USER}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      SESSION_SECRET: ${SESSION_SECRET}
+      TZ: Asia/Ho_Chi_Minh
     depends_on:
       db: { condition: service_healthy }
+    # backend: kết nối DB; monitoring: để Prometheus scrape /metrics
     networks: [backend, monitoring]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    mem_limit: 256m
+    cpus: 1.0
+
+  # ------------------------------------------------------- Nginx (entry)
+  nginx:
+    <<: *hardening
+    image: nginxinc/nginx-unprivileged:1.30.6-alpine
+    container_name: hotel_nginx
     read_only: true
     tmpfs: [/tmp]
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "8088:8080"
+      - "8443:8443"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - ./nginx/htpasswd:/etc/nginx/htpasswd:ro
+    depends_on:
+      app: { condition: service_healthy }
+    networks: [frontend, backend, monitoring]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/nginx-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    mem_limit: 128m
+    cpus: 0.5
 
+  # -------------------------------------------- pgAdmin (qua /pgadmin/)
   pgadmin:
-    image: dpage/pgadmin4
+    <<: *hardening
+    image: dpage/pgadmin4:9.18
     container_name: hotel_pgadmin
-    restart: unless-stopped
     environment:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
-    ports: ["5050:80"]
-    volumes: [pgadmin_data:/var/lib/pgadmin]
-    depends_on: [db]
-    networks: [frontend, backend]
-
-  nginx:
-    image: nginxinc/nginx-unprivileged:alpine
-    container_name: hotel_nginx
-    restart: unless-stopped
-    ports: ["8088:8080", "8443:8443"]
+      PGADMIN_LISTEN_PORT: 5050           # cổng >1024: không cần CAP_NET_BIND_SERVICE
+      PGADMIN_DISABLE_POSTFIX: "true"     # postfix cần sudo/root
+      PGADMIN_CONFIG_UPGRADE_CHECK_ENABLED: "False"
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "True"
+      PGADMIN_CONFIG_LOGIN_BANNER: '"Hotel Booking - truy cập dành cho quản trị viên"'
     volumes:
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./nginx/certs:/etc/nginx/certs:ro
-    depends_on: [app]
-    networks: [frontend, backend]
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5050/misc/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    mem_limit: 384m
+    cpus: 0.5
+
+  # ========================================================= MONITORING
+  prometheus:
+    <<: *hardening
+    image: prom/prometheus:v3.5.5
+    container_name: hotel_prometheus
+    read_only: true
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=1GB
+      - --web.external-url=/prometheus/
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus_data:/prometheus
+    networks: [monitoring]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/prometheus/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 512m
+    cpus: 0.5
+
+  grafana:
+    <<: *hardening
+    image: grafana/grafana:12.4.13
+    container_name: hotel_grafana
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_SERVER_ROOT_URL: https://${PUBLIC_HOST}:8443/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_LOG_MODE: console
+      GF_LOG_LEVEL: warn
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana-dashboards:ro
+    depends_on: [prometheus, loki]
+    # Nginx truy cập Grafana qua network monitoring (Grafana không publish cổng)
+    networks: [monitoring]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    mem_limit: 384m
+    cpus: 0.5
+
+  loki:
+    <<: *hardening
+    image: grafana/loki:3.6.11
+    container_name: hotel_loki
+    read_only: true
+    tmpfs: [/tmp]
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    networks: [monitoring]
+    # Image Loki là distroless (không có shell/wget) nên không đặt healthcheck exec;
+    # trạng thái Loki được giám sát qua target up{job="loki"} trong Prometheus.
+    mem_limit: 384m
+    cpus: 0.5
+
+  promtail:
+    <<: *hardening
+    image: grafana/promtail:3.6.11
+    container_name: hotel_promtail
+    read_only: true
+    tmpfs: [/tmp]
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      # Đọc log container qua Docker API (chỉ đọc)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail_positions:/positions
+    depends_on: [loki]
+    networks: [monitoring]
+    mem_limit: 128m
+    cpus: 0.25
+
+  cadvisor:
+    <<: *hardening
+    image: gcr.io/cadvisor/cadvisor:v0.52.1
+    container_name: hotel_cadvisor
+    read_only: true
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=15s
+      - --store_container_labels=false
+      - --whitelisted_container_labels=com.docker.compose.service,com.docker.compose.project
+      - --disable_metrics=advtcp,cpu_topology,cpuset,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp,disk,diskIO
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks: [monitoring]
+    mem_limit: 192m
+    cpus: 0.5
+
+  postgres-exporter:
+    <<: *hardening
+    image: prometheuscommunity/postgres-exporter:v0.20.1
+    container_name: hotel_postgres_exporter
+    read_only: true
+    environment:
+      DATA_SOURCE_URI: db:5432/${DB_NAME}?sslmode=disable
+      DATA_SOURCE_USER: hotel_monitor
+      DATA_SOURCE_PASS: ${MONITOR_DB_PASSWORD}
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [backend, monitoring]
+    mem_limit: 64m
+    cpus: 0.25
+
+  nginx-exporter:
+    <<: *hardening
+    image: nginx/nginx-prometheus-exporter:1.5.3
+    container_name: hotel_nginx_exporter
+    read_only: true
+    command: ["--nginx.scrape-uri=http://nginx:8081/stub_status"]
+    depends_on: [nginx]
+    networks: [monitoring]
+    mem_limit: 32m
+    cpus: 0.1
 
 networks:
   frontend:
   backend:
     internal: true
   monitoring:
+    internal: true
 
 volumes:
   pgdata:
   pgadmin_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  promtail_positions:

@@ -1,53 +1,83 @@
 const express = require('express');
-const { Pool } = require('pg');
-const client = require('prom-client');
+const path = require('path');
+const pool = require('./src/db');
+const log = require('./src/logger');
+const auth = require('./src/auth');
+const { register, httpDuration } = require('./src/metrics');
+const { ValidationError } = require('./src/validate');
+
+const problems = auth.checkConfig();
+if (problems.length) {
+  problems.forEach((p) => log.error('invalid configuration', { problem: p }));
+  process.exit(1);
+}
 
 const app = express();
-app.use(express.json());
-app.use(express.static('public'));
-client.collectDefaultMetrics();
+app.disable('x-powered-by');
+// Tin header X-Forwarded-* từ Nginx (nằm trong mạng Docker nội bộ)
+app.set('trust proxy', 'uniquelocal');
 
-const pool = new Pool({
-  host: process.env.DB_HOST, database: process.env.DB_NAME,
-  user: process.env.DB_USER, password: process.env.DB_PASSWORD,
+// Đo thời gian và ghi access log cho mọi request (trừ healthcheck/metrics)
+app.use((req, res, next) => {
+  const end = httpDuration.startTimer();
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const route = req.route ? req.baseUrl + req.route.path
+      : res.statusCode === 404 ? 'not_found'
+        : req.path.startsWith('/api') ? '/api/other' : 'static';
+    end({ method: req.method, route, status_code: res.statusCode });
+    if (req.path === '/metrics' || req.path === '/healthz') return;
+    const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+    log[level]('http request', {
+      method: req.method, path: req.path, route, status: res.statusCode,
+      duration_ms: Number(process.hrtime.bigint() - start) / 1e6, ip: req.ip,
+    });
+  });
+  next();
 });
-const log = (level, msg, extra = {}) =>
-  console.log(JSON.stringify({ time: new Date().toISOString(), level, msg, ...extra }));
 
+// /metrics chỉ dành cho Prometheus trong mạng monitoring; Nginx chặn đường này từ bên ngoài
 app.get('/metrics', async (req, res) => {
-  res.set('Content-Type', client.register.contentType);
-  res.end(await client.register.metrics());
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
 });
 
-app.get('/api/rooms', async (req, res) => {
-  const r = await pool.query('SELECT * FROM rooms ORDER BY id');
-  res.json(r.rows);
-});
-
-app.get('/api/bookings', async (req, res) => {
-  const r = await pool.query(
-    'SELECT b.*, r.name AS room FROM bookings b JOIN rooms r ON r.id=b.room_id ORDER BY b.id DESC');
-  res.json(r.rows);
-});
-
-app.post('/api/bookings', async (req, res) => {
-  const { room_id, guest_name, check_in, check_out } = req.body;
-  if (!room_id || !guest_name || !check_in || !check_out || check_out <= check_in) {
-    log('warn', 'invalid booking request');
-    return res.status(400).json({ error: 'Du lieu khong hop le' });
+app.get('/healthz', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok' });
+  } catch (err) {
+    log.error('healthcheck failed', { error: err.message });
+    res.status(503).json({ status: 'error' });
   }
-  const dup = await pool.query(
-    'SELECT 1 FROM bookings WHERE room_id=$1 AND check_in < $3 AND check_out > $2',
-    [room_id, check_in, check_out]);
-  if (dup.rowCount) {
-    log('warn', 'room already booked', { room_id });
-    return res.status(409).json({ error: 'Phong da duoc dat trong khoang nay' });
-  }
-  const r = await pool.query(
-    'INSERT INTO bookings(room_id,guest_name,check_in,check_out) VALUES($1,$2,$3,$4) RETURNING *',
-    [room_id, guest_name, check_in, check_out]);
-  log('info', 'booking created', { booking_id: r.rows[0].id, guest_name });
-  res.status(201).json(r.rows[0]);
 });
 
-app.listen(3000, () => log('info', 'server started on 3000'));
+app.use(express.json({ limit: '20kb' }));
+app.use('/api', auth.sameOrigin);
+app.use('/api', require('./src/routes/public'));
+app.use('/api/admin', require('./src/routes/admin'));
+app.use('/api', (req, res) => res.status(404).json({ error: 'Không tìm thấy API' }));
+
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h' }));
+
+// Xử lý lỗi tập trung
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+  if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'JSON không hợp lệ' });
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Dữ liệu gửi lên quá lớn' });
+  log.error('unhandled error', { error: err.message, code: err.code, path: req.path });
+  res.status(500).json({ error: 'Lỗi máy chủ, vui lòng thử lại sau' });
+});
+
+const port = Number(process.env.PORT || 3000);
+const server = app.listen(port, () => log.info('server started', { port }));
+
+function shutdown(signal) {
+  log.info('shutting down', { signal });
+  server.close(() => pool.end().finally(() => process.exit(0)));
+  setTimeout(() => process.exit(1), 10000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+process.on('unhandledRejection', (err) => log.error('unhandled rejection', { error: String(err) }));
