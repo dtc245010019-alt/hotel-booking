@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="vi"><head><meta charset="UTF-8"><title>Dat phong khach san</title>
+<style>body{font-family:sans-serif;max-width:800px;margin:30px auto}
+input,select,button{padding:6px;margin:4px}table{border-collapse:collapse;width:100%}
+td,th{border:1px solid #ccc;padding:6px}</style></head>
+<body>
+<h1>He thong Dat phong Khach san</h1>
+<h3>Dat phong</h3>
+<select id="room"></select>
+<input id="guest" placeholder="Ten khach">
+<input id="in" type="date"> <input id="out" type="date">
+<button onclick="book()">Dat phong</button>
+<p id="msg"></p>
+<h3>Danh sach phong</h3><table id="rooms"></table>
+<h3>Danh sach dat phong</h3><table id="bookings"></table>
+<script>
+const $ = id => document.getElementById(id);
+async function load(){
+  const rooms = await (await fetch('/api/rooms')).json();
+  $('room').innerHTML = rooms.map(r=>`<option value="${r.id}">${r.name} - ${r.type}</option>`).join('');
+  $('rooms').innerHTML = '<tr><th>Phong</th><th>Loai</th><th>Gia</th></tr>'+rooms.map(r=>`<tr><td>${r.name}</td><td>${r.type}</td><td>${r.price}</td></tr>`).join('');
+  const bs = await (await fetch('/api/bookings')).json();
+  $('bookings').innerHTML = '<tr><th>ID</th><th>Phong</th><th>Khach</th><th>Nhan</th><th>Tra</th></tr>'+bs.map(b=>`<tr><td>${b.id}</td><td>${b.room}</td><td>${b.guest_name}</td><td>${b.check_in.slice(0,10)}</td><td>${b.check_out.slice(0,10)}</td></tr>`).join('');
+}
+async function book(){
+  const res = await fetch('/api/bookings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({room_id:+$('room').value,guest_name:$('guest').value,check_in:$('in').value,check_out:$('out').value})});
+  const d = await res.json();
+  $('msg').textContent = res.ok ? 'Dat phong thanh cong!' : d.error;
+  load();
+}
+load();
+</script></body></html>
